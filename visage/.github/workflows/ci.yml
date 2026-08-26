@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run db:generate
+
+      - name: Bootstrap database, schema, and RLS
+        run: cp .env.example .env && node scripts/setup-db.mjs
+
+      - run: npm run typecheck
+
+      # Split out so a failure here is unmistakable in the log: this is the
+      # suite that decides whether one firm's clients can see another's.
+      - name: Tenant isolation suite
+        run: npm run test:isolation
+
+      - run: npm test
+
+      # tsc and vitest both resolve modules differently from Next's bundler, so
+      # neither catches an import Next cannot resolve. Only the build does.
+      - run: npm run build
