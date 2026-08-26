@@ -1,0 +1,565 @@
+// Visage data model.
+//
+// Two invariants hold across this whole schema and are enforced below the
+// application, in Postgres:
+//
+//   1. Every tenant-scoped table carries `firmId`, and row-level security
+//      policies filter on it. A forgotten WHERE clause yields an empty result
+//      set, not a cross-tenant disclosure. Policies live in
+//      prisma/sql/rls.sql — Prisma does not model them.
+//
+//   2. Case-scoped rows reference their case by the composite key
+//      (caseId, firmId) -> Case(id, firmId). A Document therefore *cannot*
+//      point at a Case belonging to another firm; the foreign key rejects it.
+//      This is why Case carries a redundant-looking @@unique([id, firmId]).
+//
+// The denormalized firmId is deliberate. It keeps every RLS policy uniform and
+// indexable, and it breaks the policy-recursion cycle that appears if child
+// policies have to consult Case, whose own policy would then consult them.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------- tenancy ---
+
+model Firm {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  // KMS key that wraps every per-document data key for this firm. Destroying it
+  // crypto-shreds the firm's documents, which is the deletion story.
+  kmsKeyId  String
+  createdAt DateTime @default(now())
+
+  users       User[]
+  cases       Case[]
+  invitations Invitation[]
+  auditEvents AuditEvent[]
+}
+
+enum Role {
+  OWNER
+  ATTORNEY
+  PARALEGAL
+  CLIENT
+}
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+}
+
+// How confident we are that this user is who they claim to be. v1 ships
+// EMAIL_INVITE only; ID_VERIFIED exists so that adding identity verification
+// later is a value change rather than a migration.
+enum VerificationLevel {
+  EMAIL_INVITE
+  ID_VERIFIED
+}
+
+model User {
+  id           String            @id @default(uuid()) @db.Uuid
+  firmId       String            @db.Uuid
+  email        String
+  passwordHash String
+  role         Role
+  status       UserStatus        @default(INVITED)
+  verification VerificationLevel @default(EMAIL_INVITE)
+
+  // TOTP secret, encrypted at the application layer. Required for staff before
+  // status may become ACTIVE; enforced in the auth layer, not by the schema,
+  // because the column is legitimately null between invite and enrollment.
+  mfaSecret     String?
+  mfaEnrolledAt DateTime?
+
+  createdAt DateTime  @default(now())
+  lastLogin DateTime?
+
+  firm        Firm         @relation(fields: [firmId], references: [id], onDelete: Cascade)
+  sessions    Session[]
+  caseMembers CaseMember[]
+
+  // Email is unique per firm, not globally: the same person may be a client of
+  // two different firms and must be able to hold an account at each.
+  @@unique([firmId, email])
+  @@index([firmId])
+}
+
+model Session {
+  id        String   @id @default(uuid()) @db.Uuid
+  firmId    String   @db.Uuid
+  userId    String   @db.Uuid
+  // SHA-256 of the session token. The raw token exists only in the cookie.
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  lastSeen  DateTime @default(now())
+  ip        String?
+  userAgent String?
+  revokedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([firmId])
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Invitation {
+  id        String    @id @default(uuid()) @db.Uuid
+  firmId    String    @db.Uuid
+  caseId    String?   @db.Uuid
+  email     String
+  role      Role
+  tokenHash String    @unique
+  expiresAt DateTime
+  createdAt DateTime  @default(now())
+  acceptedAt DateTime?
+  createdBy String    @db.Uuid
+
+  firm Firm  @relation(fields: [firmId], references: [id], onDelete: Cascade)
+  case Case? @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+
+  @@index([firmId])
+}
+
+// ------------------------------------------------------------------ cases ---
+
+enum CaseStatus {
+  INTAKE
+  COLLECTING
+  IN_REVIEW
+  APPROVED
+  PACKAGED
+}
+
+enum CaseRole {
+  PRIMARY_APPLICANT
+  DERIVATIVE
+  SPONSOR
+  STAFF
+}
+
+model Case {
+  id             String     @id @default(uuid()) @db.Uuid
+  firmId         String     @db.Uuid
+  caseNumber     String
+  // Recorded from the questionnaire, never recommended by the software.
+  category       String
+  status         CaseStatus @default(INTAKE)
+  leadAttorneyId String     @db.Uuid
+
+  // A spouse and children each need their own I-485, so each derivative is its
+  // own Case linked back to the principal rather than an extra profile hanging
+  // off one shared case. Keeps one applicant's facts from bleeding into another's.
+  relatedCaseId String? @db.Uuid
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  firm         Firm                 @relation(fields: [firmId], references: [id], onDelete: Cascade)
+  relatedCase  Case?                @relation("CaseFamily", fields: [relatedCaseId], references: [id], onDelete: SetNull)
+  derivatives  Case[]               @relation("CaseFamily")
+  members      CaseMember[]
+  requirements Requirement[]
+  documents    Document[]
+  profile      ProfileField[]
+  history      ProfileFieldHistory[]
+  forms        FormInstance[]
+  threads      Thread[]
+  packages     Package[]
+  invitations  Invitation[]
+  intake       Intake?
+
+  @@unique([firmId, caseNumber])
+  // Referenced by every case-scoped child so a child cannot cross firms.
+  @@unique([id, firmId])
+  @@index([firmId, status])
+}
+
+model CaseMember {
+  caseId String   @db.Uuid
+  userId String   @db.Uuid
+  firmId String   @db.Uuid
+  role   CaseRole
+  addedAt DateTime @default(now())
+
+  case Case @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([caseId, userId])
+  @@index([userId])
+  @@index([firmId])
+}
+
+model Intake {
+  id          String    @id @default(uuid()) @db.Uuid
+  firmId      String    @db.Uuid
+  caseId      String    @unique @db.Uuid
+  answers     Json      @default("{}")
+  version     Int       @default(1)
+  completedAt DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  case Case @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+
+  @@unique([caseId, firmId])
+  @@index([firmId])
+}
+
+// -------------------------------------------------------------- checklist ---
+
+enum ReqStatus {
+  NOT_STARTED
+  UPLOADED
+  IN_REVIEW
+  ACCEPTED
+  REVISION_REQUESTED
+  WITHDRAWN
+}
+
+model Requirement {
+  id     String @id @default(uuid()) @db.Uuid
+  firmId String @db.Uuid
+  caseId String @db.Uuid
+
+  key       String
+  title     String
+  // Shown to the client. Explains what the document is for, never what to do.
+  rationale String
+  required  Boolean   @default(true)
+  status    ReqStatus @default(NOT_STARTED)
+  acceptedDocTypes String[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  case      Case       @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+  documents Document[]
+
+  @@unique([caseId, key])
+  @@index([firmId])
+}
+
+// -------------------------------------------------------------- documents ---
+
+enum ScanStatus {
+  PENDING
+  CLEAN
+  INFECTED
+  FAILED
+}
+
+enum DocStatus {
+  PENDING
+  ACCEPTED
+  REVISION_REQUESTED
+  REJECTED
+}
+
+model Document {
+  id            String  @id @default(uuid()) @db.Uuid
+  firmId        String  @db.Uuid
+  caseId        String  @db.Uuid
+  requirementId String? @db.Uuid
+  uploaderId    String  @db.Uuid
+
+  docType   String
+  filename  String
+  mimeType  String
+  byteSize  Int
+  sha256    String
+
+  storageKey String
+  // Per-document AES-256-GCM data key, wrapped by the firm's KMS key.
+  dekWrapped Bytes
+  iv         Bytes
+  authTag    Bytes
+
+  scanStatus ScanStatus @default(PENDING)
+  status     DocStatus  @default(PENDING)
+
+  // Re-uploads chain rather than overwrite; nothing is hard-deleted, so a
+  // client never loses a document by replacing it.
+  version      Int     @default(1)
+  supersedesId String? @db.Uuid
+
+  createdAt DateTime @default(now())
+
+  case        Case         @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+  requirement Requirement? @relation(fields: [requirementId], references: [id], onDelete: SetNull)
+  supersedes  Document?    @relation("DocVersions", fields: [supersedesId], references: [id], onDelete: SetNull)
+  supersededBy Document[]  @relation("DocVersions")
+  pages       DocumentPage[]
+  extractions Extraction[]
+  annotations Annotation[]
+  threads     Thread[]
+
+  @@index([firmId])
+  @@index([caseId, status])
+}
+
+model DocumentPage {
+  id         String @id @default(uuid()) @db.Uuid
+  firmId     String @db.Uuid
+  documentId String @db.Uuid
+  pageNumber Int
+  storageKey String
+  dekWrapped Bytes
+  iv         Bytes
+  authTag    Bytes
+  width      Int
+  height     Int
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, pageNumber])
+  @@index([firmId])
+}
+
+// ------------------------------------------------------------- extraction ---
+
+enum ExtractionStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+model Extraction {
+  id         String @id @default(uuid()) @db.Uuid
+  firmId     String @db.Uuid
+  documentId String @db.Uuid
+
+  model         String
+  // Bump to trigger re-extraction without a migration.
+  schemaVersion String
+  status        ExtractionStatus @default(PENDING)
+  rawOutput     Json?
+  error         String?
+  createdAt     DateTime @default(now())
+
+  document Document        @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  fields   ExtractedField[]
+
+  @@index([firmId])
+  @@index([documentId])
+}
+
+model ExtractedField {
+  id           String @id @default(uuid()) @db.Uuid
+  firmId       String @db.Uuid
+  extractionId String @db.Uuid
+
+  // Canonical profile path, e.g. 'applicant.dateOfBirth'.
+  path       String
+  value      String
+  confidence Float
+  pageNumber Int
+  // The exact text the model claims to have read. Lets us string-match the
+  // claim against the page and catch a confident hallucination that a
+  // confidence score alone would wave through.
+  verbatim   String
+  bbox       Json?
+
+  extraction Extraction @relation(fields: [extractionId], references: [id], onDelete: Cascade)
+
+  @@index([firmId])
+  @@index([extractionId])
+}
+
+// ---------------------------------------------------------------- profile ---
+
+enum FieldSource {
+  INTAKE
+  EXTRACTED
+  CLIENT_CONFIRMED
+  ATTORNEY_OVERRIDE
+}
+
+// The canonical fact. One row per path per case. An attorney override outranks
+// a client confirmation, which outranks a raw extraction, which outranks a
+// questionnaire answer.
+model ProfileField {
+  firmId String @db.Uuid
+  caseId String @db.Uuid
+  path   String
+
+  value       String
+  source      FieldSource
+  sourceRefId String?     @db.Uuid
+  confidence  Float?
+  verifiedBy  String?     @db.Uuid
+  verifiedAt  DateTime?
+  updatedAt   DateTime    @updatedAt
+
+  case Case @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+
+  @@id([caseId, path])
+  @@index([firmId])
+}
+
+// Append-only. Never updated, never deleted. Answers "why does my form say this?"
+model ProfileFieldHistory {
+  id       String      @id @default(uuid()) @db.Uuid
+  firmId   String      @db.Uuid
+  caseId   String      @db.Uuid
+  path     String
+  oldValue String?
+  newValue String
+  source   FieldSource
+  actorId  String?     @db.Uuid
+  reason   String?
+  at       DateTime    @default(now())
+
+  case Case @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+
+  @@index([firmId])
+  @@index([caseId, path])
+}
+
+// ------------------------------------------------------------------ forms ---
+
+enum FormStatus {
+  DRAFT
+  ATTORNEY_REVIEW
+  APPROVED
+}
+
+model FormInstance {
+  id     String @id @default(uuid()) @db.Uuid
+  firmId String @db.Uuid
+  caseId String @db.Uuid
+
+  formCode String
+  // Pinned, and asserted against the barcode read out of the PDF itself before
+  // filling. USCIS rejects superseded editions.
+  formEdition String
+  status      FormStatus @default(DRAFT)
+
+  pdfKey     String?
+  dekWrapped Bytes?
+  iv         Bytes?
+  authTag    Bytes?
+
+  generatedAt DateTime?
+  approvedBy  String?   @db.Uuid
+  approvedAt  DateTime?
+
+  case Case @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+
+  @@unique([caseId, formCode])
+  @@index([firmId])
+}
+
+// ---------------------------------------------------------- collaboration ---
+
+enum ThreadKind {
+  CASE
+  DOCUMENT
+}
+
+model Thread {
+  id         String     @id @default(uuid()) @db.Uuid
+  firmId     String     @db.Uuid
+  caseId     String     @db.Uuid
+  kind       ThreadKind @default(CASE)
+  documentId String?    @db.Uuid
+  subject    String
+  resolved   Boolean    @default(false)
+  createdAt  DateTime   @default(now())
+
+  case        Case         @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+  document    Document?    @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  messages    Message[]
+  annotations Annotation[]
+
+  @@index([firmId])
+  @@index([caseId])
+}
+
+model Message {
+  id       String   @id @default(uuid()) @db.Uuid
+  firmId   String   @db.Uuid
+  threadId String   @db.Uuid
+  authorId String   @db.Uuid
+  body     String
+  createdAt DateTime @default(now())
+  editedAt  DateTime?
+
+  thread Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([firmId])
+  @@index([threadId, createdAt])
+}
+
+model Annotation {
+  id         String @id @default(uuid()) @db.Uuid
+  firmId     String @db.Uuid
+  documentId String @db.Uuid
+  threadId   String @db.Uuid
+  pageNumber Int
+  // Normalized to fractions of page size so it survives zoom and re-render.
+  rect       Json
+  authorId   String  @db.Uuid
+  resolved   Boolean @default(false)
+  createdAt  DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  thread   Thread   @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@index([firmId])
+  @@index([documentId])
+}
+
+// ---------------------------------------------------------------- package ---
+
+model Package {
+  id     String @id @default(uuid()) @db.Uuid
+  firmId String @db.Uuid
+  caseId String @db.Uuid
+
+  storageKey String
+  dekWrapped Bytes
+  iv         Bytes
+  authTag    Bytes
+  // Exactly what went in, so a package is reproducible and auditable later.
+  manifest    Json
+  generatedBy String   @db.Uuid
+  generatedAt DateTime @default(now())
+
+  case Case @relation(fields: [caseId, firmId], references: [id, firmId], onDelete: Cascade)
+
+  @@index([firmId])
+}
+
+// ------------------------------------------------------------------ audit ---
+
+// Append-only: the app role is granted INSERT and SELECT, never UPDATE or
+// DELETE. Compliance artifact, malpractice defense, and the first thing you
+// want during an incident.
+model AuditEvent {
+  id     String  @id @default(uuid()) @db.Uuid
+  firmId String  @db.Uuid
+  actorId String? @db.Uuid
+  caseId  String? @db.Uuid
+
+  action     String
+  targetType String
+  targetId   String
+  ip         String?
+  userAgent  String?
+  meta       Json?
+  at         DateTime @default(now())
+
+  firm Firm @relation(fields: [firmId], references: [id], onDelete: Cascade)
+
+  @@index([firmId, at])
+  @@index([caseId])
+}
