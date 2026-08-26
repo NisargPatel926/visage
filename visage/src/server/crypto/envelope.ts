@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
-import { kms } from './kms.js';
+import { kms } from './kms';
 
 export interface SealedBlob {
   ciphertext: Buffer;

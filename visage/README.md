@@ -6,8 +6,9 @@ Clients upload their documents; the system extracts the facts inside them, build
 applicant profile, and fills the official USCIS forms. Attorneys review, correct, and sign off in a
 separate console. Both sides end with one print-ready filing package.
 
-**Status: Phase 0 complete.** Foundations are built and tested — tenant isolation,
-envelope encryption, auth primitives, and the append-only audit log. No UI yet.
+**Status: Phase 1 complete.** Tenant isolation, encryption, and audit foundations
+(Phase 0) plus the intake questionnaire, checklist engine, client portal, and staff
+case queue (Phase 1). 121 tests passing.
 
 ## Start here
 
@@ -27,7 +28,12 @@ src/server/db/tenant.ts              withTenant(): the boundary every query pass
 src/server/crypto/                   envelope encryption, field encryption, blind index
 src/server/auth/                     argon2 passwords, TOTP, session tokens
 src/server/audit/log.ts              append-only audit log
+src/domain/intake/                   question bank, branching, validation, progress
+src/domain/checklist/                requirement rules (pure functions over answers)
+src/server/repositories/             intake, checklist sync, case queue
+src/app/                             login, client portal, questionnaire, staff console
 tests/isolation/                     the Phase 0 acceptance gate
+tests/intake/ tests/checklist/       Phase 1 engines and the end-to-end journey
 tools/dump-form-fields.mjs           dump a USCIS PDF's AcroForm fields to JSON
 tools/prepare-form.sh                qpdf decrypt pass, required before pdf-lib can fill
 assets/forms/i-485/2025-01-20/       official I-485 (edition 01/20/25) + instructions + field dump
@@ -40,9 +46,15 @@ docker compose up -d          # Postgres 16
 cp .env.example .env
 npm install
 npm run db:generate
-node scripts/setup-db.mjs     # roles, schema, RLS — idempotent, verifies itself
-npm test                      # 51 tests
+npm run db:setup              # roles, schema, RLS — idempotent, verifies itself
+npm run db:seed               # one firm, one attorney, one client, one case
+npm test                      # 121 tests
+npm run dev                   # http://localhost:3000
 ```
+
+Sign in with firm code `alpha`, as `client@alpha.test` or `attorney@alpha.test`,
+password `visage-dev-password`. The seed script refuses to run when
+`NODE_ENV=production`.
 
 `setup-db.mjs` exits non-zero if any tenant table lacks RLS, FORCE, or a policy.
 That check exists because `prisma db push` does not know policies exist and will
@@ -82,6 +94,50 @@ firm even if RLS were misconfigured.
 **Honest limit:** RLS defends against a missing `WHERE` clause, not against SQL
 injection that can issue its own `set_config`. That is what parameterized
 queries and the repository boundary are for.
+
+### Authentication is pre-tenant
+
+Login is a genuine exception, and it is worth understanding before changing it.
+A user must be found before we know their tenant, and a session read before we
+know who is asking — RLS correctly refuses both, so an ordinary Prisma query in
+the auth path returns zero rows and login can never succeed.
+
+The answer is a small, enumerable set of `SECURITY DEFINER` functions
+(`app.resolve_firm`, `app.auth_find_user`, `app.auth_find_session`,
+`app.auth_create_session`, `app.auth_touch_session`, `app.auth_revoke_session`),
+owned by `visage_directory` and executable only by `visage_app`. Each is an
+exact-match lookup returning at most one row. That role holds grants on exactly
+three tables — `Firm`, `User`, `Session` — and a test asserts it can reach
+nothing else. Everything after login goes through `withTenant` like any other
+query.
+
+## Intake and the checklist
+
+The questionnaire is a declarative bank of questions with branching predicates;
+the checklist is a set of pure rules over the answers. Both are data, so each
+rule is testable on its own:
+
+```ts
+deriveRequirements({ 'family.maritalStatus': 'MARRIED' })  // -> MARRIAGE_CERTIFICATE
+deriveRequirements({ 'eligibility.arrested': true })       // -> COURT_DISPOSITIONS
+```
+
+Three behaviours worth knowing:
+
+- **Answers to hidden questions are kept but not counted.** If someone says
+  married, names a spouse, then switches to single, the spouse name is retained
+  (so flipping back does not lose their typing) but excluded from everything
+  downstream, so no marriage certificate is requested.
+- **Requirements are withdrawn, never deleted.** A changed answer must not
+  destroy an uploaded document or the attorney comments on it. An item the
+  attorney already accepted is never withdrawn at all.
+- **Not everything is uploadable.** Form I-693 arrives sealed from the civil
+  surgeon; opening it to scan voids the exam, so that item is tracked with no
+  upload control and says so.
+
+The 63 Part 9 eligibility questions are extracted verbatim from the official
+form (`tools/extract-questions.mjs`) rather than retyped — the applicant signs
+under penalty of perjury, so the wording is load-bearing.
 
 ## Reproducing the form analysis
 

@@ -1,5 +1,5 @@
 import { PrismaClient } from '@prisma/client';
-import type { AuthContext } from '../src/server/db/tenant.js';
+import type { AuthContext } from '../src/server/db/tenant';
 
 /**
  * Seeding connects as superuser, not as `visage_owner`.

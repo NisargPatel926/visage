@@ -1,4 +1,4 @@
-import type { AuthContext, TenantClient } from '../db/tenant.js';
+import type { AuthContext, TenantClient } from '../db/tenant';
 
 /**
  * Append-only record of who touched what.
@@ -27,19 +27,30 @@ export async function audit(
   ctx: AuthContext,
   input: AuditInput,
 ): Promise<void> {
-  await tx.auditEvent.create({
-    data: {
-      firmId: ctx.firmId,
-      actorId: ctx.userId,
-      caseId: input.caseId ?? null,
-      action: input.action,
-      targetType: input.targetType,
-      targetId: input.targetId,
-      ip: input.ip ?? null,
-      userAgent: input.userAgent ?? null,
-      meta: (input.meta ?? undefined) as never,
-    },
-  });
+  // A bare INSERT, not prisma.auditEvent.create().
+  //
+  // Prisma's create() appends RETURNING, and PostgreSQL applies the SELECT
+  // policy to any INSERT that returns columns. Clients can append to the audit
+  // log but deliberately cannot read it, so create() fails for exactly the
+  // actors whose actions most need recording. Nothing here needs the row back.
+  await tx.$executeRaw`
+    insert into "AuditEvent" (
+      id, "firmId", "actorId", "caseId", action, "targetType", "targetId",
+      ip, "userAgent", meta, at
+    ) values (
+      gen_random_uuid(),
+      ${ctx.firmId}::uuid,
+      ${ctx.userId}::uuid,
+      ${input.caseId ?? null}::uuid,
+      ${input.action},
+      ${input.targetType},
+      ${input.targetId},
+      ${input.ip ?? null},
+      ${input.userAgent ?? null},
+      ${JSON.stringify(input.meta ?? null)}::jsonb,
+      now()
+    )
+  `;
 }
 
 /** Actions worth a row. Named constants keep the log queryable. */

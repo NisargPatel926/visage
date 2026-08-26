@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { seal, unseal } from '../../src/server/crypto/envelope.js';
-import { LocalKmsProvider, __setKmsProviderForTests } from '../../src/server/crypto/kms.js';
-import { blindIndex, blindIndexMatches, decryptField, encryptField } from '../../src/server/crypto/fields.js';
+import { seal, unseal } from '../../src/server/crypto/envelope';
+import { LocalKmsProvider, __setKmsProviderForTests } from '../../src/server/crypto/kms';
+import { blindIndex, blindIndexMatches, decryptField, encryptField } from '../../src/server/crypto/fields';
 
 const FIRM_A = 'local:firm-a';
 const FIRM_B = 'local:firm-b';

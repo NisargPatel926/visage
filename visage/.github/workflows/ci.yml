@@ -41,3 +41,7 @@ jobs:
         run: npm run test:isolation
 
       - run: npm test
+
+      # tsc and vitest both resolve modules differently from Next's bundler, so
+      # neither catches an import Next cannot resolve. Only the build does.
+      - run: npm run build

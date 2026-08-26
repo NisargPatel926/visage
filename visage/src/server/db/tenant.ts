@@ -1,5 +1,5 @@
 import type { Prisma, Role } from '@prisma/client';
-import { prisma } from './client.js';
+import { prisma } from './client';
 
 /**
  * Who is asking. Built from the authenticated session and nothing else — never

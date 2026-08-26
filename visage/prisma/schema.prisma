@@ -238,6 +238,11 @@ model Requirement {
   status    ReqStatus @default(NOT_STARTED)
   acceptedDocTypes String[]
 
+  // Some items are tracked but never collected through the portal. Form I-693
+  // arrives from the civil surgeon in a sealed envelope; opening it to scan it
+  // voids the exam, so the UI must never offer an upload control for it.
+  uploadable Boolean @default(true)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

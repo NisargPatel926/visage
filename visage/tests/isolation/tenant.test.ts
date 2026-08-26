@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from 'vitest';
-import { prisma } from '../../src/server/db/client.js';
-import { resolveFirmBySlug, withTenant } from '../../src/server/db/tenant.js';
-import { reseed, type Seed } from '../fixtures.js';
+import { prisma } from '../../src/server/db/client';
+import { resolveFirmBySlug, withTenant } from '../../src/server/db/tenant';
+import { reseed, type Seed } from '../fixtures';
 
 /**
  * The Phase 0 acceptance gate.
@@ -276,5 +276,47 @@ describe('login bootstrap', () => {
   it('does not become a way to read Firm rows generally', async () => {
     // The Firm table itself stays closed without tenant context.
     expect(await prisma.firm.findMany()).toHaveLength(0);
+  });
+});
+
+describe('audit log: append by anyone, read by staff', () => {
+  it('a client can append to the audit log', async () => {
+    // Client actions — uploads, answers — are exactly what must be recorded.
+    // A staff-only write policy would silently drop them.
+    const { audit } = await import('../../src/server/audit/log');
+    await expect(
+      withTenant(s.firmA.client1, (tx) =>
+        audit(tx, s.firmA.client1, {
+          action: 'document.uploaded', targetType: 'Document',
+          targetId: s.firmA.doc1, caseId: s.firmA.case1,
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it('but cannot read it back', async () => {
+    const { audit } = await import('../../src/server/audit/log');
+    await withTenant(s.firmA.client1, (tx) =>
+      audit(tx, s.firmA.client1, {
+        action: 'document.uploaded', targetType: 'Document', targetId: s.firmA.doc1,
+      }),
+    );
+    const seen = await withTenant(s.firmA.client1, (tx) => tx.auditEvent.findMany());
+    expect(seen).toHaveLength(0);
+  });
+
+  it('and staff can see what the client wrote', async () => {
+    // A distinct action, because this file seeds once (beforeAll) and the
+    // tests above already wrote 'document.uploaded' rows.
+    const { audit } = await import('../../src/server/audit/log');
+    await withTenant(s.firmA.client1, (tx) =>
+      audit(tx, s.firmA.client1, {
+        action: 'document.downloaded', targetType: 'Document', targetId: s.firmA.doc1,
+      }),
+    );
+    const seen = await withTenant(s.firmA.attorney, (tx) =>
+      tx.auditEvent.findMany({ where: { action: 'document.downloaded' } }));
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.actorId).toBe(s.firmA.client1.userId);
   });
 });

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { hashPassword, verifyPassword } from '../../src/server/auth/password.js';
-import { generateTotpSecret, verifyTotp } from '../../src/server/auth/totp.js';
-import { generateSessionToken, hashSessionToken } from '../../src/server/auth/session.js';
+import { hashPassword, verifyPassword } from '../../src/server/auth/password';
+import { generateTotpSecret, verifyTotp } from '../../src/server/auth/totp';
+import { generateSessionToken, hashSessionToken } from '../../src/server/auth/session';
 import { TOTP, Secret } from 'otpauth';
 
 describe('passwords', () => {

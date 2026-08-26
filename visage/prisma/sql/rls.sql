@@ -72,7 +72,7 @@ create or replace function app.can_access_document(p_doc_id uuid) returns boolea
 -- FORCE matters as much as ENABLE: without it the table owner bypasses every
 -- policy below, and any test run as the owner would pass vacuously.
 do $$
-declare t text;
+declare t text; p text;
 begin
   foreach t in array array[
     'Firm','User','Session','Invitation','Case','CaseMember','Intake',
@@ -82,7 +82,12 @@ begin
   ] loop
     execute format('alter table %I enable row level security', t);
     execute format('alter table %I force row level security', t);
-    execute format('drop policy if exists tenant_isolation on %I', t);
+    -- Drop every existing policy, not just one known name: this file gets
+    -- re-applied after each `prisma db push`, and a renamed policy left behind
+    -- would silently widen access.
+    for p in select polname from pg_policy where polrelid = format('%I', t)::regclass loop
+      execute format('drop policy %I on %I', p, t);
+    end loop;
   end loop;
 end
 $$;
@@ -183,12 +188,23 @@ create policy tenant_isolation on "Message"
 
 -- ----------------------------------------------------------- audit ----
 
--- Readable by staff only, and append-only: the INSERT/SELECT grant below is
--- the enforcement, since a policy cannot stop an UPDATE the role may perform.
-create policy tenant_isolation on "AuditEvent"
-  for all
-  using      ("firmId" = app.current_firm_id() and app.is_staff())
+-- Split deliberately, because writing and reading the audit log are different
+-- privileges. A client uploading a document must generate an audit row; a
+-- client must never be able to read the log. A single FOR ALL policy cannot
+-- express that: PostgreSQL applies the SELECT policy to any INSERT carrying a
+-- RETURNING clause, so a staff-only USING clause silently blocks clients from
+-- writing at all. (Prisma's create() always uses RETURNING — see audit() in
+-- src/server/audit/log.ts, which issues a bare INSERT for this reason.)
+create policy audit_append on "AuditEvent"
+  for insert
   with check ("firmId" = app.current_firm_id());
+
+create policy audit_read on "AuditEvent"
+  for select
+  using ("firmId" = app.current_firm_id() and app.is_staff());
+
+-- No UPDATE or DELETE policy exists, so those commands match no rows even
+-- before the revoked grants below are considered.
 
 -- ----------------------------------------------------------- grants ----
 
@@ -211,7 +227,22 @@ revoke update, delete on "ProfileFieldHistory" from visage_app;
 -- grants — the only thing reachable through it is three non-sensitive columns
 -- for one slug.
 grant usage on schema public to visage_directory;
+
+-- Exactly what the SECURITY DEFINER auth functions below need, and nothing
+-- more. visage_directory can bypass RLS, so every grant here widens what those
+-- functions could reach; it holds no privilege on any case, document, or
+-- message table.
 grant select on "Firm" to visage_directory;
+grant select on "User" to visage_directory;
+grant select, insert, update on "Session" to visage_directory;
+
+-- Created *as* visage_directory via SET ROLE, rather than created by
+-- visage_owner and handed over afterwards. Ownership transfer worked once and
+-- then made this file non-idempotent: on the second run visage_owner no longer
+-- owns the function, so CREATE OR REPLACE fails with "must be owner of
+-- function". Since `prisma db push` drops policies and this file must be
+-- re-applied after every schema change, re-runnability is not optional.
+set role visage_directory;
 
 create or replace function app.resolve_firm(p_slug text)
   returns table (id uuid, name text, slug text)
@@ -220,11 +251,84 @@ create or replace function app.resolve_firm(p_slug text)
   set search_path = public, pg_temp
   as $$ select f.id, f.name, f.slug from "Firm" f where f.slug = p_slug $$;
 
--- Order matters: grants must be issued while visage_owner still owns the
--- function. After the ownership transfer below it no longer can, and psql
--- reports that only as a WARNING — leaving EXECUTE on PUBLIC, which is the
--- opposite of what this block is for.
+-- Issued while visage_directory owns the function, so they actually apply;
+-- a grant from a non-owner is only a WARNING and would silently leave EXECUTE
+-- on PUBLIC.
 revoke all on function app.resolve_firm(text) from public;
 grant execute on function app.resolve_firm(text) to visage_app;
 
-alter function app.resolve_firm(text) owner to visage_directory;
+reset role;
+
+-- ------------------------------------------------ authentication surface ----
+
+-- Authentication is inherently pre-tenant: we must find a user before we know
+-- which tenant to scope to, and we must read a session before we know who is
+-- asking. RLS correctly refuses all of that, so these four functions are the
+-- complete, enumerable set of privileged reads the auth path needs.
+--
+-- Each is narrow: exact-match lookups returning at most one row, no filtering
+-- the caller controls beyond the key itself. They are owned by
+-- visage_directory (BYPASSRLS, NOLOGIN) and executable only by visage_app.
+-- Everything after login goes through withTenant like any other query.
+set role visage_directory;
+
+-- Exact (firm, email). Returns the password hash because that is what
+-- authenticating means; login reports one generic failure for every outcome,
+-- so this is not a membership oracle.
+create or replace function app.auth_find_user(p_firm_id uuid, p_email text)
+  returns table (id uuid, firm_id uuid, role "Role", status "UserStatus",
+                 password_hash text, mfa_secret text)
+  language sql stable security definer set search_path = public, pg_temp
+  as $$
+    select u.id, u."firmId", u.role, u.status, u."passwordHash", u."mfaSecret"
+    from "User" u
+    where u."firmId" = p_firm_id and lower(u.email) = lower(p_email)
+  $$;
+
+create or replace function app.auth_create_session(
+  p_firm_id uuid, p_user_id uuid, p_token_hash text,
+  p_expires timestamptz, p_ip text, p_user_agent text)
+  returns void
+  language sql volatile security definer set search_path = public, pg_temp
+  as $$
+    insert into "Session" (id, "firmId", "userId", "tokenHash", "expiresAt",
+                           "createdAt", "lastSeen", ip, "userAgent")
+    values (gen_random_uuid(), p_firm_id, p_user_id, p_token_hash, p_expires,
+            now(), now(), p_ip, p_user_agent)
+  $$;
+
+-- Lookup by token hash only. The token is 32 bytes of entropy, so possession
+-- is the authorisation; there is nothing to enumerate.
+create or replace function app.auth_find_session(p_token_hash text)
+  returns table (user_id uuid, firm_id uuid, role "Role", status "UserStatus",
+                 expires_at timestamptz, last_seen timestamptz, revoked_at timestamptz)
+  language sql stable security definer set search_path = public, pg_temp
+  as $$
+    select u.id, u."firmId", u.role, u.status, s."expiresAt", s."lastSeen", s."revokedAt"
+    from "Session" s join "User" u on u.id = s."userId"
+    where s."tokenHash" = p_token_hash
+  $$;
+
+create or replace function app.auth_touch_session(p_token_hash text)
+  returns void
+  language sql volatile security definer set search_path = public, pg_temp
+  as $$ update "Session" set "lastSeen" = now() where "tokenHash" = p_token_hash $$;
+
+create or replace function app.auth_revoke_session(p_token_hash text)
+  returns void
+  language sql volatile security definer set search_path = public, pg_temp
+  as $$ update "Session" set "revokedAt" = now() where "tokenHash" = p_token_hash $$;
+
+revoke all on function app.auth_find_user(uuid, text) from public;
+revoke all on function app.auth_create_session(uuid, uuid, text, timestamptz, text, text) from public;
+revoke all on function app.auth_find_session(text) from public;
+revoke all on function app.auth_touch_session(text) from public;
+revoke all on function app.auth_revoke_session(text) from public;
+
+grant execute on function app.auth_find_user(uuid, text) to visage_app;
+grant execute on function app.auth_create_session(uuid, uuid, text, timestamptz, text, text) to visage_app;
+grant execute on function app.auth_find_session(text) to visage_app;
+grant execute on function app.auth_touch_session(text) to visage_app;
+grant execute on function app.auth_revoke_session(text) to visage_app;
+
+reset role;
