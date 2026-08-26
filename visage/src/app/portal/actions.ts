@@ -42,3 +42,40 @@ export async function finishIntake(caseId: string) {
   await withTenant(ctx, (tx) => completeIntake(tx, ctx, caseId));
   revalidatePath('/portal');
 }
+
+export interface UploadState { error?: string; ok?: string }
+
+/** Upload a document against a checklist item. */
+export async function uploadDocument(
+  caseId: string,
+  requirementId: string,
+  _prev: UploadState,
+  form: FormData,
+): Promise<UploadState> {
+  const ctx = await currentUser();
+  if (!ctx) return { error: 'Your session has expired. Please sign in again.' };
+
+  const file = form.get('file');
+  if (!(file instanceof File) || file.size === 0) return { error: 'Choose a file first.' };
+
+  const { ingestDocument, UploadRejected } = await import('../../server/documents/ingest');
+  const bytes = Buffer.from(await file.arrayBuffer());
+
+  try {
+    await withTenant(ctx, (tx) =>
+      ingestDocument(tx, ctx, {
+        caseId, requirementId, filename: file.name,
+        declaredMime: file.type, bytes,
+      }),
+    );
+  } catch (err) {
+    // A rejection carries a message written for the applicant; anything else
+    // must not leak internals to them.
+    if (err instanceof UploadRejected) return { error: err.message };
+    console.error('upload failed', err);
+    return { error: 'Something went wrong storing that file. Please try again.' };
+  }
+
+  revalidatePath('/portal');
+  return { ok: `${file.name} uploaded.` };
+}

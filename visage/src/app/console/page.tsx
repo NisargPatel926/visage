@@ -2,6 +2,7 @@ import { redirect } from 'next/navigation';
 import { currentUser } from '../../server/auth/currentUser';
 import { withTenant, isStaff } from '../../server/db/tenant';
 import { caseQueue } from '../../server/repositories/cases';
+import Link from 'next/link';
 import { logout } from '../../server/auth/actions';
 
 export const dynamic = 'force-dynamic';
@@ -46,7 +47,7 @@ export default async function ConsolePage() {
               )}
               {queue.map((c) => (
                 <tr key={c.id}>
-                  <td><strong>{c.caseNumber}</strong></td>
+                  <td><Link href={`/console/case/${c.id}`}><strong>{c.caseNumber}</strong></Link></td>
                   <td>{c.applicantName}</td>
                   <td><span className="pill">{c.status}</span></td>
                   <td>{c.intakePercent}%</td>

@@ -68,3 +68,21 @@ export const AuditAction = {
   FORM_APPROVED: 'form.approved',
   PACKAGE_GENERATED: 'package.generated',
 } as const;
+
+/**
+ * Record an event in its own transaction, so it survives the rollback of the
+ * operation it describes.
+ *
+ * The ordinary `audit` above deliberately shares the caller's transaction: if
+ * the action is undone, its audit row should be too, and the log never claims
+ * something happened that didn't. Rejections invert that. "This upload was
+ * blocked as infected" is precisely the row you must keep, and it is attached
+ * to work that is about to be rolled back — so it needs a transaction of its
+ * own that commits regardless.
+ *
+ * Use only for events describing something that did NOT happen.
+ */
+export async function auditDetached(ctx: AuthContext, input: AuditInput): Promise<void> {
+  const { withTenant } = await import('../db/tenant');
+  await withTenant(ctx, (tx) => audit(tx, ctx, input));
+}

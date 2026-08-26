@@ -6,9 +6,10 @@ Clients upload their documents; the system extracts the facts inside them, build
 applicant profile, and fills the official USCIS forms. Attorneys review, correct, and sign off in a
 separate console. Both sides end with one print-ready filing package.
 
-**Status: Phase 1 complete.** Tenant isolation, encryption, and audit foundations
-(Phase 0) plus the intake questionnaire, checklist engine, client portal, and staff
-case queue (Phase 1). 121 tests passing.
+**Status: Phases 0-2 and 4 complete.** Tenant isolation, encryption and audit
+foundations; intake questionnaire and checklist engine; the encrypted document
+pipeline; and a filled, printable Form I-485 generated from the applicant's
+answers. 157 tests passing.
 
 ## Start here
 
@@ -31,6 +32,10 @@ src/server/audit/log.ts              append-only audit log
 src/domain/intake/                   question bank, branching, validation, progress
 src/domain/checklist/                requirement rules (pure functions over answers)
 src/server/repositories/             intake, checklist sync, case queue
+src/server/storage/                  object storage: quarantine and main buckets
+src/server/documents/                scan, sanitise, encrypt, store, read
+src/domain/forms/                    profile derivation and the I-485 field mapping
+src/server/forms/generate.ts         pdf-lib filler, edition assertion, Part 14 overflow
 src/app/                             login, client portal, questionnaire, staff console
 tests/isolation/                     the Phase 0 acceptance gate
 tests/intake/ tests/checklist/       Phase 1 engines and the end-to-end journey
@@ -48,7 +53,8 @@ npm install
 npm run db:generate
 npm run db:setup              # roles, schema, RLS — idempotent, verifies itself
 npm run db:seed               # one firm, one attorney, one client, one case
-npm test                      # 121 tests
+npm run demo                  # a realistic applicant: intake, checklist, a document
+npm test                      # 157 tests
 npm run dev                   # http://localhost:3000
 ```
 
@@ -167,3 +173,58 @@ Three things that shape the build, all verified against the file:
 This is intended to live at `NisargPatel926/visage`. It currently sits under `visage/` in
 `git_practice` because the GitHub App backing the authoring session lacks repository-creation
 permission. The directory is a self-contained project root and moves without path rewrites.
+
+## The document pipeline
+
+```
+upload -> quarantine bucket -> scan -> sanitise -> encrypt -> main bucket -> row
+```
+
+The order is the point. Presigned direct-to-bucket uploads are the usual pattern
+and are wrong here: they put unscanned attacker-controlled bytes in the bucket we
+serve from. Nothing is ever served out of quarantine, and the quarantine object
+is deleted whether ingestion succeeds or fails.
+
+- **PDFs are rewritten by qpdf**, which drops JavaScript, embedded files, and
+  launch actions. Rewriting rather than rasterising keeps the text layer, which
+  the Phase 3 extraction will need.
+- **Images are re-encoded by sharp**, which drops EXIF. Passport photos routinely
+  carry the GPS coordinates of someone's home.
+- **Type is decided by magic bytes**, never the declared MIME. Anything
+  unrecognised is rejected rather than stored with a guessed content type.
+- **Re-uploads supersede, never overwrite**, so replacing a document does not take
+  the attorney's annotations with it.
+- **Downloads never hand out a bucket URL.** Every read goes through a route that
+  authorises via RLS, audits, decrypts, and streams.
+
+The bundled scanner is structural, not antivirus: it catches active content and
+type confusion, and it flags EICAR so the pipeline is exercised in CI. Set
+`SCANNER=clamav` in production.
+
+A rejected upload still writes an audit row, and it is written in its own
+transaction — the rejection rolls the main transaction back, and a record of a
+blocked upload must not roll back with it.
+
+## Form I-485
+
+```bash
+npm run demo   # then open the case in the console and click "Open filled I-485"
+```
+
+The mapping (`src/domain/forms/i485.ts`) is written against the committed field
+dump, never from memory. Three things that only the real form tells you:
+
+- **The A-Number repeats in the header of all 24 pages.** Filling only the first
+  leaves the rest looking blank. The names cannot be derived either — the
+  subform indices skip 19, so `#subform[i].AlienNumber[i]` is right for the first
+  nineteen pages and wrong for the last five. The field list comes from the dump.
+- **Part 14 has exactly four continuation slots**, each needing a page, part, and
+  item number. More continuations than slots is reported, never silently
+  truncated — the demo applicant needs five and the generator says so.
+- **The generator refuses to fill a form whose embedded barcode edition does not
+  match the mapping.** USCIS rejects superseded editions, so a beautifully filled
+  wrong-edition form is worse than an error.
+
+Golden-file tests fill a fixture, save, and read the values back out of the
+produced PDF. There is also a test asserting every field name in the mapping
+exists on the real form.

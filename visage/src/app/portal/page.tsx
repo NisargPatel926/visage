@@ -6,6 +6,7 @@ import { clientCase } from '../../server/repositories/cases';
 import { progress } from '../../domain/intake/engine';
 import { QUESTION_BANK } from '../../domain/intake/questions';
 import { logout } from '../../server/auth/actions';
+import { UploadControl } from './upload';
 
 export const dynamic = 'force-dynamic';
 
@@ -22,6 +23,10 @@ export default async function PortalPage() {
   if (!ctx) redirect('/login');
 
   const kase = await withTenant(ctx, (tx) => clientCase(tx));
+  const documents = kase
+    ? await withTenant(ctx, (tx) =>
+        tx.document.findMany({ where: { caseId: kase.id }, orderBy: { createdAt: 'desc' } }))
+    : [];
   if (!kase) {
     return <div className="wrap"><h1>No case yet</h1>
       <p className="lede">Your attorney has not opened a case for you.</p></div>;
@@ -84,13 +89,25 @@ export default async function PortalPage() {
                   </h3>
                   <p>{r.rationale}</p>
                 </div>
-                <div style={{ textAlign: 'right', minWidth: 150 }}>
+                <div style={{ textAlign: 'right', minWidth: 260 }}>
                   <span className={`pill ${r.status === 'ACCEPTED' ? 'ok' : r.status === 'REVISION_REQUESTED' ? 'warn' : ''}`}>
                     {STATUS_LABEL[r.status] ?? r.status}
                   </span>
-                  {!r.uploadable && (
-                    <p className="help" style={{ marginTop: 6 }}>Do not upload — bring it sealed.</p>
+                  {r.uploadable ? (
+                    <UploadControl caseId={kase.id} requirementId={r.id}
+                                   accept="application/pdf,image/*" />
+                  ) : (
+                    <p className="help" style={{ marginTop: 6 }}>
+                      Do not upload — bring it to your attorney sealed.
+                    </p>
                   )}
+                  {documents.filter((d) => d.requirementId === r.id).map((d) => (
+                    <p className="help" key={d.id} style={{ marginTop: 4 }}>
+                      <a href={`/api/documents/${d.id}`} target="_blank" rel="noreferrer">
+                        {d.filename}
+                      </a>{' '}v{d.version}
+                    </p>
+                  ))}
                 </div>
               </div>
             ))}
