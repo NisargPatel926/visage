@@ -93,12 +93,11 @@ Sign in with firm code `alpha`, as `client@alpha.test` or
 
 ---
 
-## A note on branches
+## GitHub Pages
 
-All of the work above lives on **`claude/visage-legal-portal-plan-0g74r1`**.
-The default branch, `master`, still contains only the original `ReadME.txt`, so
-the repository homepage shows none of it until that branch is merged or the
-default is changed.
+`docs/` holds a static walkthrough — screenshots of the running application, the
+document pipeline, and the findings from mapping the real I-485. To publish it,
+point **Settings → Pages** at the `master` branch and the `/docs` folder.
 
-GitHub Pages, if enabled, should point at the working branch and the `/docs`
-folder.
+It is a walkthrough, not the application. Pages serves static files only, and
+Visage needs a Node server, Postgres, and a KMS key.
